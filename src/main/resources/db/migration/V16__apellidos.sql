@@ -1,0 +1,2 @@
+ALTER TABLE `usuarios` 
+ADD COLUMN `apellido` VARCHAR(255) NULL DEFAULT NULL AFTER `nombre`;

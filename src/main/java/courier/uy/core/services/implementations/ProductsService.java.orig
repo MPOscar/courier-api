@@ -1,0 +1,1320 @@
+package catalogo.services.implementations;
+
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import javax.ws.rs.core.MultivaluedMap;
+
+import com.amazonaws.auth.AWSCredentials;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3Client;
+import com.amazonaws.services.s3.model.ListObjectsRequest;
+import com.amazonaws.services.s3.model.ObjectListing;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import catalogo.db.CategoriasDAO;
+import catalogo.db.EmpaquesDAO;
+import catalogo.db.EmpresasDAO;
+import catalogo.db.GruposDAO;
+import catalogo.db.PalletsDAO;
+import catalogo.db.ParamsDAO;
+import catalogo.db.PresentacionesDAO;
+import catalogo.db.ProductosAccionesDAO;
+import catalogo.db.ProductosDAO;
+import catalogo.exceptions.ModelException;
+import catalogo.exceptions.ServiceException;
+import catalogo.model.Categoria;
+import catalogo.model.Empaque;
+import catalogo.model.Empresa;
+import catalogo.model.Grupo;
+import catalogo.model.ListaDeVenta;
+import catalogo.model.Pallet;
+import catalogo.model.Param;
+import catalogo.model.Presentacion;
+import catalogo.model.Producto;
+import catalogo.model.ProductoAccion;
+import catalogo.model.Usuario;
+import catalogo.model.UsuarioEmpresa;
+import catalogo.resources.dto.AcknowledgeRequest;
+import catalogo.resources.dto.ExcelCliente;
+import catalogo.resources.dto.ExcelProduct;
+import catalogo.resources.dto.PaginadoRequest;
+import catalogo.resources.dto.PaginadoResponse;
+import catalogo.resources.dto.UsuarioJwt;
+import catalogo.resources.dto.VisibilityRequest;
+import catalogo.services.interfaces.IProductService;
+import catalogo.utils.mapstruct.Cloner;
+import catalogo.utils.poiji.ExcelRNCliente;
+import catalogo.utils.poiji.ExcelRNProducto;
+
+public class ProductsService implements IProductService {
+	private static final Logger LOGGER = LoggerFactory.getLogger(ProductsService.class);
+
+	private ProductosDAO productsRepository;
+	private EmpresasDAO businessesRepository;
+	private CategoriasDAO categoriesRepository;
+	private PresentacionesDAO presentationsRepository;
+	private EmpaquesDAO packsRepository;
+	private GruposDAO groupsRepository;
+	@SuppressWarnings("unused")
+	private PalletsDAO palletsRepository;
+	private ProductosAccionesDAO productActionsRepository;
+	private ParamsDAO paramsDAO;
+
+	public ProductsService(ProductosDAO productosDao, CategoriasDAO categoriasDAO, PresentacionesDAO presentacionesDAO,
+			EmpaquesDAO empaquesDAO, EmpresasDAO empresasDAO, GruposDAO gruposDAO, PalletsDAO palletsDAO,
+			ProductosAccionesDAO productosAccionesDAO, ParamsDAO paramsDAO) {
+		this.productsRepository = productosDao;
+		this.categoriesRepository = categoriasDAO;
+		this.presentationsRepository = presentacionesDAO;
+		this.packsRepository = empaquesDAO;
+		this.businessesRepository = empresasDAO;
+		this.groupsRepository = gruposDAO;
+		this.palletsRepository = palletsDAO;
+		this.productActionsRepository = productosAccionesDAO;
+		this.paramsDAO = paramsDAO;
+	}
+
+	@Override
+	public void InsertExcel(List<ExcelProduct> products, UsuarioJwt user, Boolean updateExistent,
+			Boolean deleteExistent, Boolean deleteAll) throws ServiceException {
+		try {
+			if (deleteAll) {
+				try {
+					this.productsRepository.deleteAll(user.getUsuarioEmpresa().getEmpresa().getId());
+				} catch (Exception ex) {
+					throw new Exception(
+							"No se pudieron eliminar los Productos asociados a la Empresa " + ex.getMessage());
+				}
+			}
+
+			for (ExcelProduct excelProduct : products) {
+				try {
+					checkIfProductExists(excelProduct, updateExistent, deleteExistent);
+					if (excelProduct.getWasCreated()) {
+						Producto product = excelProduct.getProduct();
+						addCategory(user.getUsuarioEmpresa().getEmpresa(), product);
+						addPresentations(product);
+						product.setEmpresa(user.getUsuarioEmpresa().getEmpresa());
+						addPacks(user.getUsuarioEmpresa().getEmpresa(), excelProduct);
+					}
+
+				} catch (Exception e) {
+					excelProduct.setWasCreated(false);
+					excelProduct.setHasErrors(true);
+					excelProduct.bddErrors += "Error inesperado " + e.getMessage() + " ";
+					LOGGER.error("PRODUCTOSSERVICE EXCEPTION: " + e.getMessage());
+				}
+			}
+			this.productsRepository.insertBatch(products);
+		} catch (Exception e) {
+			throw new ServiceException("No se pudieron agregar los productos " + e.getMessage());
+		}
+	}
+
+	@Override
+	public void InsertExcelRN(List<ExcelProduct> products, Empresa empresa, Boolean updateExistent,
+			Boolean deleteExistent, Boolean deleteAll) throws ServiceException {
+		try {
+			if (deleteAll) {
+				try {
+					this.productsRepository.deleteAll(empresa.getId());
+				} catch (Exception ex) {
+					throw new Exception(
+							"No se pudieron eliminar los Productos asociados a la Empresa " + ex.getMessage());
+				}
+			}
+
+			for (ExcelProduct excelProduct : products) {
+				try {
+					checkIfProductExists(excelProduct, updateExistent, deleteExistent);
+					if (excelProduct.getWasCreated()) {
+						Producto product = excelProduct.getProduct();
+						addCategory(empresa, product);
+						addPresentations(product);
+						product.setEmpresa(empresa);
+						addPacks(empresa, excelProduct);
+					}
+
+				} catch (Exception e) {
+					excelProduct.setWasCreated(false);
+					excelProduct.setHasErrors(true);
+					excelProduct.bddErrors += "Error inesperado " + e.getMessage() + " ";
+					LOGGER.error("PRODUCTOSSERVICE EXCEPTION: " + e.getMessage());
+				}
+			}
+			this.productsRepository.insertBatch(products);
+		} catch (Exception e) {
+			throw new ServiceException("No se pudieron agregar los productos " + e.getMessage());
+		}
+	}
+
+	public void InsertClienteExcel(List<ExcelCliente> clientes, UsuarioJwt user, Boolean updateExistent,
+			Boolean deleteExistent, Boolean deleteAll) throws ServiceException {
+		try {
+
+			for (ExcelCliente excelCliente : clientes) {
+				try {
+					Empresa empresa = businessesRepository.findByKey("gln", excelCliente.getEmpresa().getGln()).get();
+					List<Grupo> grupoRN = excelCliente.getEmpresa().getGrupos();
+
+					if (empresa != null) {
+						for (Grupo grupo : grupoRN)
+							grupo.setEmpresa(empresa);
+						empresa.setGrupos(grupoRN);
+						businessesRepository.update(empresa);
+						excelCliente.setHasErrors(false);
+					}
+
+				} catch (Exception e) {
+					excelCliente.setWasCreated(false);
+					excelCliente.setHasErrors(true);
+					excelCliente.bddErrors += "Error inesperado " + e.getMessage() + " ";
+					LOGGER.error("PRODUCTOSSERVICE EXCEPTION: " + e.getMessage());
+				}
+			}
+			// this.productsRepository.insertBatch(products, user);
+		} catch (Exception e) {
+			throw new ServiceException("No se pudieron agregar los productos " + e.getMessage());
+		}
+	}
+
+	/**
+	 * 
+	 * Verifica si existe un {@link Producto} a partir del GTIN/CPP y lanza una
+	 * excepción en caso que esto se cumpla
+	 * 
+	 * @param product
+	 * @throws ServiceException
+	 */
+	private void checkIfProductExists(Producto product) throws ServiceException {
+		Optional<Producto> existingCpp = this.productsRepository.findByCpp(product.getCpp());
+		Optional<Producto> existe = this.productsRepository.findByGtinAndCpp(product.getGtin(), product.getCpp());
+		if (existe.isPresent()) {
+			throw new ServiceException("Ya existe un producto con este GTIN/CPP");
+		}
+		if (existingCpp.isPresent()) {
+			if (existingCpp.get().getEmpresa().getId() == product.getEmpresa().getId())
+				throw new ServiceException("Esta empresa ya tiene otro producto con este cpp");
+		}
+	}
+
+	/**
+	 * 
+	 * Chequea si existe un {@link Producto} y de existir se actualizan sus Datos
+	 * solo si se solicita mediante parámetros. Se registran errores en caso del
+	 * {@link Producto} no pertenecer a la {@link Empresa} actualmente logueada. Se
+	 * puede especificar además que se eliminen los {@link Producto} y se realizará
+	 * siempre que no se especifique que se desea actualizar el {@link Producto}
+	 * 
+	 * @param excelProduct
+	 * @param actualizarExistentes
+	 * @param eliminarExistentes
+	 */
+	private ExcelProduct checkIfProductExists(final ExcelProduct excelProduct, final Boolean actualizarExistentes,
+			final Boolean eliminarExistentes) {
+		if (excelProduct.getWasCreated()) {
+			Optional<Producto> producto = this.productsRepository.findByGtinAndCpp(excelProduct.getProduct().getGtin(),
+					excelProduct.getProduct().getCpp());
+
+			producto.ifPresent(e -> {
+				if (e.getEmpresa().getId() != excelProduct.getProduct().getEmpresa().getId()) {
+					if (actualizarExistentes) {
+						excelProduct.setWasCreated(true);
+						Producto bddProd = e;
+						bddProd.copy(excelProduct.getProduct());
+						excelProduct.setProduct(bddProd);
+
+					} else {
+						excelProduct.setWasCreated(false);
+						excelProduct.setHasErrors(true);
+						excelProduct.bddErrors += "Existe otro Producto con este GTIN/CPP y no pertenece a la Empresa actualmente logueada. ";
+					}
+				} else if (!actualizarExistentes) {
+					if (eliminarExistentes) {
+						e.eliminar();
+					} else {
+						excelProduct.setWasCreated(false);
+						excelProduct.setHasErrors(true);
+						excelProduct.bddErrors += "Existe otro Producto con este GTIN/CPP y no se solicitó actualizar Productos existentes. ";
+					}
+				}
+			});
+		}
+
+		return excelProduct;
+
+	}
+
+	private void addPacks(UsuarioJwt user, Producto product) throws ServiceException {
+		Empresa business = user.getUsuarioEmpresa().getEmpresa();
+
+		HashSet<Empaque> bddPacks = new HashSet<Empaque>();
+		// business =
+		// this.businessesRepository.findById(user.getUsuarioEmpresa().getId());
+<<<<<<< HEAD
+		// business = user.getUsuarioEmpresa().getEmpresa();
+=======
+		business = user.getUsuarioEmpresa().getEmpresa();
+>>>>>>> sincronizar-listaventas-rnclasico
+		long id = business.getId();
+		business.setId(id);
+		if (product.getEmpaques() != null && product.getEmpaques().size() != 0) {
+
+			for (Empaque emp : product.getEmpaques()) {
+				Empaque pack = new Empaque();
+				Empaque fatherPack = new Empaque();
+				pack.setEmpresa(business);
+				fatherPack.setEmpresa(business);
+				emp.setEmpresa(business);
+				if (emp.getPadre() != null) {
+					emp.getPadre().setEmpresa(business);
+					if (emp.getPadre().getPadre() != null)
+						emp.getPadre().getPadre().setEmpresa(business);
+				}
+				Optional<Empaque> optPack = packsRepository.findByGtin("" + emp.getGtin());
+				if (optPack.isPresent() && !optPack.get().getGtin().equals("")
+						&& optPack.get().getEmpresa().getId() != business.getId()) {
+					throw new ServiceException("Otra empresa tiene un empaque con este gtin");
+				}
+
+				else {
+					if (optPack.isPresent() && !optPack.get().getGtin().equals("")
+							&& optPack.get().getEmpresa().getId() == business.getId()) {// si hay empaque de la misma
+																						// empresa lo uso
+						pack = optPack.get();
+						pack.copyForExcel(emp.getGtin(), "" + emp.getNivel(), emp.getUnidadMedida(), "" + emp.getAlto(),
+								"" + emp.getAncho(), "" + emp.getProfundidad(), "" + emp.getPesoBruto(),
+								"" + emp.getCantidad(), emp.getCpp(), emp.getClasificacion());
+						pack.setEmpresa(business);
+						pack.setPresentacion(emp.getPresentacion());
+						this.packsRepository.save(pack);
+					}
+
+					else {
+						pack = packsRepository.crear(emp, business);
+					}
+					if (emp.getPadre() != null) {
+						emp.getPadre().setEmpresa(business);
+						Optional<Empaque> optFather = packsRepository.findByGtin("" + emp.getPadre().getGtin());
+						if (optFather.isPresent() && !optFather.get().getGtin().equals("")
+								&& optFather.get().getEmpresa().getId() != business.getId()) {
+							throw new ServiceException("Otra empresa tiene un empaque padre con este gtin");
+						} else {
+							if (optFather.isPresent() && !optFather.get().getGtin().equals("")
+									&& optFather.get().getEmpresa().getId() == business.getId()) {
+								fatherPack = optFather.get();
+								fatherPack.copyForExcel(emp.getPadre().getGtin(), "" + emp.getPadre().getNivel(),
+										emp.getPadre().getUnidadMedida(), "" + emp.getPadre().getAlto(),
+										"" + emp.getPadre().getAncho(), "" + emp.getPadre().getProfundidad(),
+										"" + emp.getPadre().getPesoBruto(), "" + emp.getPadre().getCantidad(),
+										emp.getPadre().getCpp(), emp.getPadre().getClasificacion());
+								fatherPack.setEmpresa(business);
+								fatherPack.setPresentacion(emp.getPadre().getPresentacion());
+								this.packsRepository.save(fatherPack);
+							} else {
+								fatherPack = packsRepository.crear(emp.getPadre(), business);
+							}
+							pack.setPadre(fatherPack);
+						}
+						if (emp.getPadre().getPadre() != null) {
+							emp.getPadre().getPadre().setEmpresa(business);
+							optFather = packsRepository.findByGtin("" + emp.getPadre().getPadre().getGtin());
+							if (optFather.isPresent() && !optFather.get().getGtin().equals("")
+									&& optFather.get().getEmpresa().getId() != business.getId()) {
+								throw new ServiceException("Otra empresa tiene un empaque padre con este gtin");
+							} else {
+								if (optFather.isPresent() && !optFather.get().getGtin().equals("")
+										&& optFather.get().getEmpresa().getId() == business.getId()) {
+									fatherPack = optFather.get();
+									fatherPack.copyForExcel(emp.getPadre().getGtin(), "" + emp.getPadre().getNivel(),
+											emp.getPadre().getUnidadMedida(), "" + emp.getPadre().getAlto(),
+											"" + emp.getPadre().getAncho(), "" + emp.getPadre().getProfundidad(),
+											"" + emp.getPadre().getPesoBruto(), "" + emp.getPadre().getCantidad(),
+											emp.getPadre().getCpp(), emp.getPadre().getClasificacion());
+									fatherPack.setEmpresa(business);
+									fatherPack.setPresentacion(emp.getPadre().getPresentacion());
+									this.packsRepository.save(fatherPack);
+								} else {
+									fatherPack = packsRepository.crear(emp.getPadre().getPadre(), business);
+								}
+								pack.getPadre().setPadre(fatherPack);
+							}
+
+						}
+					}
+					bddPacks.add(pack);
+					this.packsRepository.save(pack);
+				}
+
+			}
+		}
+		product.setEmpaques(bddPacks);
+	}
+
+	private void addPacks(Empresa empresa, ExcelProduct excelProduct) {
+		Producto product = excelProduct.getProduct();
+		Empresa business = empresa;
+		HashSet<Empaque> bddPacks = new HashSet<Empaque>();
+		if (product.getEmpaques() != null && product.getEmpaques().size() != 0) {
+
+			for (Empaque emp : product.getEmpaques()) {
+				Empaque pack = new Empaque();
+				Empaque fatherPack = new Empaque();
+
+				Optional<Empaque> optPack = packsRepository.findByGtin("" + emp.getGtin());
+				if (optPack.isPresent() && !optPack.get().getGtin().equals("")
+						&& optPack.get().getEmpresa().getId() != business.getId()) {
+					excelProduct.setHasErrors(true);
+					excelProduct.bddErrors += "Otra empresa tiene un empaque con este gtin. ";
+					excelProduct.getProduct().setEmpaques(null);
+				} else {
+					if (optPack.isPresent() && !optPack.get().getGtin().equals("")
+							&& optPack.get().getEmpresa().getId() == business.getId()) {// si hay empaque de la misma
+																						// empresa lo uso
+						pack = optPack.get();
+						pack.copyForExcel(emp.getGtin(), "" + emp.getNivel(), emp.getUnidadMedida(), "" + emp.getAlto(),
+								"" + emp.getAncho(), "" + emp.getProfundidad(), "" + emp.getPesoBruto(),
+								"" + emp.getCantidad(), emp.getCpp(), emp.getClasificacion());
+						pack.setEmpresa(business);
+						pack.setPresentacion(emp.getPresentacion());
+						this.packsRepository.save(pack);
+					}
+
+					else {
+						pack = packsRepository.crear(emp, empresa);
+					}
+					if (emp.getPadre() != null) {
+						Optional<Empaque> optFather = packsRepository.findByGtin("" + emp.getPadre().getGtin());
+						if (optFather.isPresent() && !optFather.get().getGtin().equals("")
+								&& optFather.get().getEmpresa().getId() != business.getId()) {
+							excelProduct.setHasErrors(true);
+							excelProduct.bddErrors += "Otra empresa tiene un empaque padre con este gtin. ";
+							pack.setPadre(null);
+						} else {
+							if (optFather.isPresent() && !optFather.get().getGtin().equals("")
+									&& optFather.get().getEmpresa().getId() == business.getId()) {
+								fatherPack = optFather.get();
+								fatherPack.copyForExcel(emp.getPadre().getGtin(), "" + emp.getPadre().getNivel(),
+										emp.getPadre().getUnidadMedida(), "" + emp.getPadre().getAlto(),
+										"" + emp.getPadre().getAncho(), "" + emp.getPadre().getProfundidad(),
+										"" + emp.getPadre().getPesoBruto(), "" + emp.getPadre().getCantidad(),
+										emp.getPadre().getCpp(), emp.getPadre().getClasificacion());
+								fatherPack.setEmpresa(business);
+								fatherPack.setPresentacion(emp.getPadre().getPresentacion());
+								this.packsRepository.save(fatherPack);
+							} else {
+								fatherPack = packsRepository.crear(emp.getPadre(), empresa);
+							}
+							pack.setPadre(fatherPack);
+							bddPacks.add(fatherPack);
+						}
+
+					}
+					bddPacks.add(pack);
+					this.packsRepository.save(pack);// si hay error no tiene que hacer esto
+				}
+
+			}
+		}
+		product.setEmpaques(bddPacks);
+	}
+
+	private void addPresentations(Producto product) {
+		if (product.getPresentacion() != null && !product.getPresentacion().getNombre().trim().equals("")) {
+			Presentacion presentation;
+			Optional<Presentacion> optPresentation = presentationsRepository
+					.findByName(product.getPresentacion().getNombre());
+			if (optPresentation.isPresent())
+				presentation = optPresentation.get();
+			else
+				presentation = presentationsRepository.crear(product.getPresentacion());
+			product.setPresentacion(presentation);
+		}
+		if (product.getEmpaques() != null) {
+			for (Empaque emp : product.getEmpaques()) {
+				if (emp.getPadre() != null && emp.getPadre().getPresentacion() != null
+						&& !emp.getPadre().getPresentacion().getNombre().trim().equals("")) {
+					Presentacion fatherPresentation;
+					Optional<Presentacion> optFatherPresentation = presentationsRepository
+							.findByName(emp.getPadre().getPresentacion().getNombre());
+					if (optFatherPresentation.isPresent())
+						fatherPresentation = optFatherPresentation.get();
+					else
+						fatherPresentation = presentationsRepository.crear(emp.getPadre().getPresentacion());
+					emp.getPadre().setPresentacion(fatherPresentation);
+				}
+				if (emp.getPresentacion() != null && !emp.getPresentacion().getNombre().trim().equals("")) {
+					Presentacion packPresentation;
+					Optional<Presentacion> optPackPresentation = presentationsRepository
+							.findByName(emp.getPresentacion().getNombre());
+					if (optPackPresentation.isPresent())
+						packPresentation = optPackPresentation.get();
+					else
+						packPresentation = presentationsRepository.crear(emp.getPresentacion());
+					emp.setPresentacion(packPresentation);
+				}
+			}
+		}
+
+	}
+
+	@Override
+	public Producto Modify(Producto p, UsuarioJwt ue) throws ServiceException {
+		Producto product = this.productsRepository.findById(p.getId());
+
+		if (product.getEmpresa().getId() == ue.getUsuarioEmpresa().getEmpresa().getId()) {
+			if (!p.getDescripcion().equals(product.getDescripcion())) {
+				product.setDescripcion(p.getDescripcion());
+				descriptionIsNotRepeated(product);
+			}
+			product.setMarca(p.getMarca());
+			product.setPaisOrigen(p.getPaisOrigen());
+			product.setPesoBruto(p.getPesoBruto());
+			product.setContenidoNeto(p.getContenidoNeto());
+			if (p.getFoto() != null && !p.getFoto().trim().equals("")) {
+				product.setFoto(p.getFoto());
+			}
+
+			product.setUnidadMedida(p.getUnidadMedida());
+			product.setUnidadMedidaPesoBruto(p.getUnidadMedidaPesoBruto());
+			product.setCpp(p.getCpp());
+			product.setNivelMinimoVenta(p.getNivelMinimoVenta());
+			product.setAlto(p.getAlto());
+			product.setEsPromo(p.getEsPromo());
+			product.setAncho(p.getAncho());
+			product.setProfundidad(p.getProfundidad());
+			product.setEmpaques(null);
+			if (p.getPresentacion() != null) {
+				Optional<Presentacion> optPresentation = presentationsRepository
+						.findByName(p.getPresentacion().getNombre());
+				if (optPresentation.isPresent()) {
+					product.setPresentacion(optPresentation.get());
+				} else {
+					Presentacion pres = new Presentacion();
+					pres.setNombre(p.getPresentacion().getNombre());
+					product.setPresentacion(pres);
+					addPresentations(product);
+				}
+			}
+			if (p.getCategoria() != null) {
+				try {
+					Categoria cat = p.getCategoria();
+					Categoria catToAdd;
+					Optional<Categoria> bddCat;
+					if (cat.getPadre() != null) {
+						bddCat = this.categoriesRepository.findByNameAndParent(cat.getNombre(),
+								ue.getUsuarioEmpresa().getEmpresa(), cat.getPadre().getNombre());
+					} else
+						bddCat = this.categoriesRepository.findByName(cat.getNombre(),
+								ue.getUsuarioEmpresa().getEmpresa());
+					if (bddCat.isPresent()) {
+						catToAdd = bddCat.get();
+					} else {
+						catToAdd = new Categoria();
+						catToAdd.setDescripcion(cat.getDescripcion());
+						catToAdd.setEmpresa(ue.getUsuarioEmpresa().getEmpresa());
+						catToAdd.setNombre(cat.getNombre());
+						catToAdd.setPosicion(cat.getPosicion());
+					}
+					catToAdd.setNivel((long) 2);
+					if (cat.getPadre() != null) {
+						Categoria fatherCatToAdd;
+						Optional<Categoria> bddFatherCat = this.categoriesRepository
+								.findByName(cat.getPadre().getNombre(), ue.getUsuarioEmpresa().getEmpresa());
+						if (bddFatherCat.isPresent()) {
+							fatherCatToAdd = bddFatherCat.get();
+						} else {
+							fatherCatToAdd = new Categoria();
+							fatherCatToAdd.setDescripcion(cat.getDescripcion());
+							fatherCatToAdd.setEmpresa(ue.getUsuarioEmpresa().getEmpresa());
+							fatherCatToAdd.setNombre(cat.getPadre().getNombre());
+							fatherCatToAdd.setPosicion(cat.getPadre().getPosicion());
+						}
+						fatherCatToAdd.setNivel((long) 1);
+						catToAdd.checkForParentLoop(fatherCatToAdd);
+						this.categoriesRepository.insert(fatherCatToAdd);
+						catToAdd.setPadre(fatherCatToAdd);
+					}
+					this.categoriesRepository.insert(catToAdd);
+					product.setCategoria(catToAdd);
+
+					// addCategory(ue, product);
+				} catch (ModelException ex) {
+					throw new ServiceException("Error en la categoria del producto");
+				}
+
+			}
+
+			product.setEmpaques(p.getEmpaques());
+			addPacks(ue, product);
+
+			if (p.getPallet() != null && !p.getPallet().getAlto().trim().equals("")) {
+				Pallet existingPallet = p.getPallet();
+				Pallet newPallet = new Pallet();
+				newPallet.setAlto(existingPallet.getAlto());
+				newPallet.setAncho(existingPallet.getAncho());
+				newPallet.setProfundidad(existingPallet.getProfundidad());
+				newPallet.setCajas(existingPallet.getCajas());
+				newPallet.setCamadas(existingPallet.getCamadas());
+				newPallet.setUnidadesVenta(existingPallet.getUnidadesVenta());
+				product.setPallet(null);
+				product.setPallet(newPallet);
+			}
+
+			this.productsRepository.update(product);
+			return product;
+		} else
+			throw new ServiceException("Solo puedes editar un grupo de la empresa activa");
+
+	}
+
+	private void descriptionIsNotRepeated(Producto p) throws ServiceException {
+		List<Producto> productsWithDesc = this.productsRepository.findByKey("descripcion", p.getDescripcion());
+		for (Producto product : productsWithDesc) {
+			if (product.getId() != p.getId())
+				throw new ServiceException("Esta ya tiene un producto con esta descripcion");
+		}
+	}
+
+	private void addCategory(Empresa empresa, Producto product) {
+		Categoria cat = product.getCategoria();
+		if (cat.getPadre() != null) {
+			Categoria father;
+			Optional<Categoria> optFather = this.categoriesRepository.findByName(cat.getPadre().getNombre(), empresa);
+			if (optFather.isPresent()) {
+				father = optFather.get();
+			} else
+				father = this.categoriesRepository.crear(cat.getPadre(), empresa);
+			cat.setPadre(father);
+		}
+		Optional<Categoria> optCat = this.categoriesRepository.findByName(cat.getNombre(), empresa);
+		if (optCat.isPresent()) {
+			cat = optCat.get();
+		} else
+			cat = this.categoriesRepository.crear(cat, empresa);
+		product.setCategoria(cat);
+	}
+
+	@Override
+	public Producto Insert(Producto p, UsuarioJwt user) throws ServiceException {
+		try {
+			p.setEmpresa(user.getUsuarioEmpresa().getEmpresa());
+			checkIfProductExists(p);
+			Producto product = new Producto();
+			product.setDescripcion(p.getDescripcion());
+			product.setCpp(p.getCpp());
+			product.setGtin(p.getGtin());
+			product.setPaisOrigen(p.getPaisOrigen());
+			product.setMarca(p.getMarca());
+			product.setContenidoNeto(p.getContenidoNeto());
+			product.setPesoBruto(p.getPesoBruto());
+			product.setEsPromo(p.getEsPromo());
+			product.setUnidadMedida(p.getUnidadMedida());
+			product.setUnidadMedidaPesoBruto(p.getUnidadMedidaPesoBruto());
+			product.setAlto(p.getAlto());
+			product.setAncho(p.getAncho());
+			product.setProfundidad(p.getProfundidad());
+			product.setFoto(p.getFoto());
+			product.setNivelMinimoVenta(p.getNivelMinimoVenta());
+			product.setEmpaques(p.getEmpaques());
+			Optional<Presentacion> optPresentation = presentationsRepository
+					.findByName(p.getPresentacion().getNombre());
+			if (optPresentation.isPresent()) {
+				product.setPresentacion(optPresentation.get());
+			} else {
+				Presentacion pres = new Presentacion();
+				pres.setNombre(p.getPresentacion().getNombre());
+				product.setPresentacion(pres);
+				addPresentations(product);
+			}
+			Categoria cat = p.getCategoria();
+			cat.setNivel((long) 2);
+			cat.getPadre().setNivel((long) 1);
+			cat.checkForParentLoop(cat.getPadre());
+			product.setCategoria(cat);
+			addCategory(user.getUsuarioEmpresa().getEmpresa(), product);
+
+			addPacks(user, product);
+
+			product.setEmpresa(user.getUsuarioEmpresa().getEmpresa());
+
+			if (p.getPallet() != null && !p.getPallet().getAlto().trim().equals("")) {
+				Pallet existingPallet = p.getPallet();
+				Pallet newPallet = new Pallet();
+				newPallet.setAlto(existingPallet.getAlto());
+				newPallet.setAncho(existingPallet.getAncho());
+				newPallet.setProfundidad(existingPallet.getProfundidad());
+				newPallet.setCajas(existingPallet.getCajas());
+				newPallet.setCamadas(existingPallet.getCamadas());
+				newPallet.setUnidadesVenta(existingPallet.getUnidadesVenta());
+				product.setPallet(newPallet);
+			}
+			this.productsRepository.insert(product);
+
+			return product;
+		} catch (ModelException ex) {
+			throw new ServiceException("Error al insertar Producto");
+		}
+	}
+
+	@Override
+	public List<Producto> GetAll(UsuarioEmpresa ue, MultivaluedMap<String, String> parametros) {
+		// FIXME Revisar implementación de consulta a BD para evitar cargar todos los
+		// productos
+		Empresa empresa = ue.getEmpresa();
+		Empresa bddEmp = this.businessesRepository.findById(empresa.getId());
+		Set<Producto> toReturn = bddEmp.getProductosEmpresa();
+		List<Producto> allProducts = new ArrayList<Producto>();
+		allProducts.addAll(toReturn);
+		allProducts.removeIf(p -> p.getEliminado() == true);
+		return allProducts;
+	}
+
+	@Override
+	public PaginadoResponse<List<Producto>> GetVisibleForBusiness(PaginadoRequest pr, Long businessId,
+			UsuarioEmpresa ue) throws ServiceException {
+		try {
+			return this.productsRepository.getVisibleForBussines(pr, businessId, ue);
+		} catch (ModelException me) {
+			throw new ServiceException(
+					"Ocurrió un error al obtener el Productos visibles por la Empresa. Error: " + me.getMessage());
+		} catch (Exception e) {
+			throw new ServiceException(
+					"Ocurrió un error al obtener el Productos visibles por la Empresa. Error: " + e.getMessage());
+		}
+
+	}
+
+	@Override
+	public Set<Producto> obtenerProductosVisiblesEmpresa(UsuarioEmpresa ue, String businessId) throws ServiceException {
+		Empresa empresa = this.businessesRepository.findById(ue.getEmpresa().getId());
+		Empresa proveedor = null;
+		Optional<Empresa> bussiness = this.businessesRepository.findByKey("rut", businessId);
+		proveedor = bussiness.orElse(this.businessesRepository.findById(Long.parseLong(businessId)));
+		if (proveedor != null) {
+			Set<Producto> toReturn = new HashSet<Producto>();
+			toReturn.addAll(this.obtenerProductosVisiblesPorEmpresa(empresa, proveedor));
+			return toReturn;
+
+		}
+		throw new ServiceException("No existe este proveedor");
+	}
+
+	@Override
+	public PaginadoResponse<List<Producto>> obtenerProductosVisiblesEmpresa(PaginadoRequest pr, UsuarioEmpresa ue,
+			Long businessId) throws ServiceException {
+		try {
+			return this.productsRepository.getVisibleByBussines(pr, businessId, ue);
+		} catch (ModelException e) {
+			throw new ServiceException("Ocurrió un error al obtener el listado de Productos visibles por la Empresa "
+					+ ue.getEmpresa().getNombre() + ". Error: " + e.getMessage());
+		} catch (Exception e) {
+			throw new ServiceException("Error: " + e.getMessage());
+		}
+	}
+
+	@Override
+	public PaginadoResponse<List<Producto>> obtenerProductosVisiblesParaEmpresaSeleccionada(PaginadoRequest pr,
+			UsuarioEmpresa ue, Long businessId) throws ServiceException {
+		try {
+			return this.productsRepository.getMyVisibleProductForSelectedBussines(pr, businessId, ue);
+		} catch (ModelException e) {
+			throw new ServiceException("Ocurrió un error al obtener el listado de Productos visibles por la Empresa "
+					+ ue.getEmpresa().getNombre() + ". Error: " + e.getMessage());
+		} catch (Exception e) {
+			throw new ServiceException("Error: " + e.getMessage());
+		}
+	}
+
+	@Override
+	public PaginadoResponse<List<Producto>> obtenerProductosEmpresa(PaginadoRequest pr, UsuarioEmpresa ue,
+			Long businessId) throws ServiceException {
+		try {
+			return this.productsRepository.obtenerProductosEmpresa(pr, businessId, ue);
+		} catch (ModelException e) {
+			throw new ServiceException("Ocurrió un error al obtener el listado de Productos visibles por la Empresa "
+					+ ue.getEmpresa().getNombre() + ". Error: " + e.getMessage());
+		} catch (Exception e) {
+			throw new ServiceException("Error: " + e.getMessage());
+		}
+	}
+
+	private void InsertVisibilityActions(Producto newVisibilityProduct, Producto oldVisibilityProduct) {
+		Set<Grupo> groupsToAdd = newVisibilityProduct.getGruposConVisibilidad();
+		Set<Empresa> businessesFromGroupsToAdd = new HashSet<Empresa>(); // A
+		for (Grupo g : groupsToAdd) {
+			businessesFromGroupsToAdd.addAll(g.getEmpresas());
+		}
+
+		Set<Grupo> groupsThatAlreadyHad = oldVisibilityProduct.getGruposConVisibilidad();
+		Set<Empresa> businessesFromGroupsThatAlreadyHad = new HashSet<Empresa>(); // B
+		for (Grupo g : groupsThatAlreadyHad) {
+			businessesFromGroupsThatAlreadyHad.addAll(g.getEmpresas());
+		}
+
+		Set<Empresa> businessesToAdd = newVisibilityProduct.getEmpresasConVisibilidad(); // C
+		if (newVisibilityProduct.getEsPublico()) {
+			businessesToAdd.addAll(this.businessesRepository.getAll());
+		}
+		if (newVisibilityProduct.getEsPrivado()) {
+			businessesToAdd = new HashSet<Empresa>();
+			businessesFromGroupsToAdd = new HashSet<Empresa>();
+		}
+		Set<Empresa> businessesThatAlreadyHad = oldVisibilityProduct.getEmpresasConVisibilidad(); // D
+		if (oldVisibilityProduct.getEsPublico()) {
+			businessesThatAlreadyHad.addAll(this.businessesRepository.getAll());
+		}
+		if (oldVisibilityProduct.getEsPrivado()) {
+			businessesThatAlreadyHad = new HashSet<Empresa>();
+			businessesFromGroupsThatAlreadyHad = new HashSet<Empresa>();
+		}
+
+		Set<Empresa> businessesThatNowHaveVisibility = new HashSet<Empresa>();
+		businessesThatNowHaveVisibility.addAll(businessesToAdd);
+		businessesThatNowHaveVisibility.addAll(businessesFromGroupsToAdd); // A + C
+
+		Set<Empresa> businessesThatHadVisibility = new HashSet<Empresa>();
+		businessesThatHadVisibility.addAll(businessesThatAlreadyHad);
+		businessesThatHadVisibility.addAll(businessesFromGroupsThatAlreadyHad); // B + D
+
+		// Final ahora tienen = (A + C) - (B + D)
+		Set<Empresa> businessesThatWonVisibility = new HashSet<Empresa>();
+		businessesThatWonVisibility.addAll(businessesThatNowHaveVisibility);
+		businessesThatWonVisibility.removeAll(businessesThatHadVisibility);
+
+		// for (Empresa emp : businessesThatWonVisibility) {
+		// this.InsertProductAction(oldVisibilityProduct, emp, "POST");
+		// }
+
+		// Final dejan de tener = (B+D) - (A+C)
+		Set<Empresa> businessesThatLostVisibility = new HashSet<Empresa>();
+		businessesThatLostVisibility.addAll(businessesThatHadVisibility);
+		businessesThatLostVisibility.removeAll(businessesThatNowHaveVisibility);
+
+		/*
+		 * for(int i = 0 ; i < businessesThatLostVisibility.size(); i++ ){
+		 * businessesThatLostVisibility. }
+		 */
+		// for (Empresa emp : businessesThatLostVisibility) {
+		// this.InsertProductAction(oldVisibilityProduct, emp, "DELETE");
+		// }
+	}
+
+	@Override
+	public void ChangeVisibility(Producto p, UsuarioEmpresa ue) throws ServiceException {
+
+		this.businessesRepository.existeEmpresa(ue.getEmpresa().getId());
+		Empresa e = this.businessesRepository.findById(ue.getEmpresa().getId());
+		if (e.getValidado() && !e.getEliminado()) {
+			Producto existingProduct = this.productsRepository.findById(p.getId());
+			if (existingProduct != null) {
+				if (p.getEsPrivado() || p.getEsPublico()) {
+					existingProduct.setEsPublico(p.getEsPublico());
+					existingProduct.setEsPrivado(p.getEsPrivado());
+					this.productsRepository.update(existingProduct);
+					this.InsertVisibilityActions(p, existingProduct);
+
+				} else {
+					existingProduct.setEsPrivado(p.getEsPrivado());
+					existingProduct.setEsPublico(p.getEsPublico());
+					this.InsertVisibilityActions(p, existingProduct);
+					existingProduct.setGruposConVisibilidad(p.getGruposConVisibilidad());
+					existingProduct.setEmpresasConVisibilidad(p.getEmpresasConVisibilidad());
+					this.productsRepository.update(existingProduct);
+				}
+
+			} else
+				throw new ServiceException("No existe este producto");
+		} else {
+			throw new ServiceException(
+					"Antes de agregarle productos a una categoría un administrador debe validar esta empresa");
+		}
+	}
+
+	@Override
+	public void Delete(String id, UsuarioJwt user) throws ServiceException {
+		Long pId = Long.parseLong(id);
+		Producto p = this.productsRepository.findById(pId);
+		Empresa e = this.businessesRepository.findById(user.getUsuarioEmpresa().getEmpresa().getId());
+		if (e.getValidado() && !e.getEliminado()) {
+			if (p.getEmpresa().getId() == e.getId()) {
+
+				Set<Grupo> groupsWithVisibility = p.getGruposConVisibilidad();
+				Set<Empresa> businessesFromGroupsWithVisibility = new HashSet<Empresa>(); // B
+				for (Grupo g : groupsWithVisibility) {
+					businessesFromGroupsWithVisibility.addAll(g.getEmpresas());
+				}
+				p.getEmpresasConVisibilidad().addAll(businessesFromGroupsWithVisibility);
+				if (p.getEsPrivado()) {
+					p.setEmpresasConVisibilidad(new HashSet<Empresa>());
+				}
+				if (p.getEsPublico()) {
+					Set<Empresa> allBusinesses = new HashSet<Empresa>();
+					allBusinesses.addAll(this.businessesRepository.getAll());
+					p.setEmpresasConVisibilidad(allBusinesses);
+				}
+
+				// for (Empresa lostVisibility : p.getEmpresasConVisibilidad()) {
+				// this.InsertProductAction(p, lostVisibility, "DELETE");
+				// }
+
+				p.eliminar();
+				this.productsRepository.update(p);
+			} else
+				throw new ServiceException("Solo se pueden eliminar productos de la propia empresa");
+		} else {
+			throw new ServiceException("Antes de eliminar un producto un administrador debe validar esta empresa");
+		}
+	}
+
+	@Override
+	public void ChangeMassiveVisibility(VisibilityRequest visibilityRequest, UsuarioEmpresa usuarioEmpresa)
+			throws ServiceException {
+		for (Producto p : visibilityRequest.getProductos()) {
+			Producto existingProduct = this.productsRepository.findById(p.getId());
+			if (existingProduct != null) {
+				if (visibilityRequest.getAddVisibility()) {
+					existingProduct.setEsPrivado(true);
+					existingProduct.setEsPublico(false);
+				}
+
+				// Set<Empresa> businessesForProduct =
+				// existingProduct.getEmpresasConVisibilidad();
+				// Set<Grupo> groupsForProduct = existingProduct.getGruposConVisibilidad();
+
+				if (visibilityRequest.getEmpresas() != null && visibilityRequest.getEmpresas().size() > 0) {
+					this.productsRepository.insertarEmpresasConVisibilidad(p, visibilityRequest.getEmpresas(),
+							visibilityRequest.getAddVisibility());
+				}
+
+				if (visibilityRequest.getGrupos() != null && visibilityRequest.getGrupos().size() > 0) {
+					this.productsRepository.insertarGruposConVisibilidad(p, visibilityRequest.getGrupos(),
+							visibilityRequest.getAddVisibility());
+				}
+
+				/*
+				 * FIXME Set<Empresa> visibilityRequestBusinesses = new HashSet<Empresa>();
+				 * visibilityRequestBusinesses.addAll(visibilityRequest.getEmpresas());
+				 * Set<Grupo> visibilityRequestGroups = new HashSet<Grupo>();
+				 * visibilityRequestGroups.addAll(visibilityRequest.getGrupos());
+				 * 
+				 * //p.setEmpresasConVisibilidad(visibilityRequestBusinesses);
+				 * //p.setGruposConVisibilidad(visibilityRequestGroups);
+				 * existingProduct.setEmpresasConVisibilidad(empresasParaAgregarVisibilidad);
+				 * existingProduct.setGruposConVisibilidad(visibilityRequestGroups);
+				 */
+
+				this.InsertVisibilityActions(p, existingProduct);
+
+				// FIXME existingProduct.setEmpresasConVisibilidad(businessesForProduct);
+				// FIXME existingProduct.setGruposConVisibilidad(groupsForProduct);
+				this.productsRepository.update(existingProduct);
+
+			}
+		}
+
+	}
+
+	@Override
+	// FIXME Relizar consultas optimizadas para cambiar la Visibilidad!!!
+	public void ChangeBusinessVisibility(VisibilityRequest visibilityRequest, UsuarioEmpresa usuarioEmpresa)
+			throws ServiceException {
+		if (visibilityRequest.getEmpresas() != null && visibilityRequest.getEmpresas().size() != 0) {
+			long empresaId = visibilityRequest.getEmpresas().get(0).getId();
+			Empresa emp = this.businessesRepository.findById(empresaId);
+			if (emp != null) {
+				this.productsRepository.eliminarTodaVisibilidadEmpresasProveedor(empresaId,
+						usuarioEmpresa.getEmpresa().getId());
+				if (visibilityRequest.getEmpresas() != null && visibilityRequest.getEmpresas().size() > 0) {
+					this.productsRepository.actulizarEmpresasConVisibilidad(visibilityRequest.getProductos(),
+							empresaId);
+				}
+
+				if (visibilityRequest.getGrupos() != null && visibilityRequest.getGrupos().size() > 0) {
+					this.productsRepository.actulizarGruposConVisibilidad(visibilityRequest.getProductos(),
+							visibilityRequest.getGrupos().get(0).getId());
+				}
+				/*
+				 * OLD CODE FOR REVIEW PaginadoResponse<List<Producto>> visibleProducts = this
+				 * .GetVisibleForBusiness(new PaginadoRequest(1L, 1000000L), emp.getId(),
+				 * usuarioEmpresa); List<Producto> visibleProductsList =
+				 * visibleProducts.getElementos(); for (Producto p : visibleProductsList) {
+				 * Producto bddProd = this.productsRepository.findById(p.getId()); if
+				 * (p.getVisibilidadPorGrupo()) { if (!p.getVisibilidadPorGrupo()) {
+				 * bddProd.getEmpresasConVisibilidad().remove(emp); //
+				 * this.InsertProductAction(bddProd, emp, "DELETE"); } }
+				 * this.productsRepository.update(bddProd); } for (Producto p :
+				 * visibilityRequest.getProductos()) { Producto bddProd =
+				 * this.productsRepository.findById(p.getId()); if
+				 * (!bddProd.getEmpresasConVisibilidad().contains(emp)) {
+				 * bddProd.getEmpresasConVisibilidad().add(emp); //
+				 * this.InsertProductAction(bddProd, emp, "POST"); }
+				 * 
+				 * this.productsRepository.update(bddProd); }
+				 */
+			} else
+				throw new ServiceException("No existe empresa con este id");
+		} else
+			throw new ServiceException("Debes enviar una empresa");
+
+	}
+
+	/*
+	 * /* Esta acción devuelve una lista de acciones en formato JSON que hacen
+	 * referencia a los productos que cambiaron junto con el tipo de cambio desde la
+	 * última fecha de consulta. Se puede enviar como parámetro URI el id de la
+	 * empresa a la cuál se le quieren actualizar los productos, si no se manda el
+	 * API devuelve las acciones para todas las empresas. A su vez también se puede
+	 * enviar el id del proveedor del cual se quieren consultar los productos, si no
+	 * se envía ninguno el API devuelve las acciones de todos los proveedores.
+	 */
+
+	@Override
+	public List<ProductoAccion> GetNotAcknowledgedActions(Long businessId, Long providerId, UsuarioEmpresa ue) {
+		if (businessId == 0 && !ue.getUsuario().esAdministradorSistema())
+			businessId = ue.getEmpresa().getId();
+		Optional<Empresa> bussiness = this.businessesRepository.findByKey("rut", "" + businessId);
+		if (bussiness.isPresent())
+			businessId = bussiness.get().getId();
+		Optional<Empresa> provider = this.businessesRepository.findByKey("rut", "" + providerId);
+		if (provider.isPresent())
+			providerId = provider.get().getId();
+		if (businessId == 0 && providerId == 0) {
+			return this.productActionsRepository.getAllNotAcknowledged();
+		} else if (businessId == 0) {
+			return this.productActionsRepository.getAllNotAcknowledgedFromProvider(providerId);
+		} else if (providerId == 0) {
+			return this.productActionsRepository.getAllNotAcknowledgedFromBusiness(businessId);
+		} else {
+			return this.productActionsRepository.getAllNotAcknowledgedFromBusinessAndProvider(businessId, providerId);
+		}
+	}
+
+	@Override
+	public void SetAcknowledge(AcknowledgeRequest acknowledgeRequest, UsuarioEmpresa ue) throws ServiceException {
+		Optional<Empresa> providerOptional = this.businessesRepository.findByKey("rut",
+				"" + acknowledgeRequest.getIdEmpresa());
+		Empresa provider = providerOptional
+				.orElse(this.businessesRepository.findById((long) acknowledgeRequest.getIdEmpresa()));
+		if (provider != null) {
+			for (ProductoAccion toAcknowledge : acknowledgeRequest.getAcciones()) {
+				ProductoAccion existingProductAction = this.productActionsRepository.findById(toAcknowledge.getId());
+				if (existingProductAction != null) {
+					Usuario usuario = ue.getUsuario();
+					if (!usuario.esAdministradorSistema()
+							&& !(existingProductAction.getEmpresaId() == ue.getEmpresa().getId())) {
+						continue;
+					}
+					existingProductAction.setFechaRecibido();
+					this.productActionsRepository.update(existingProductAction);
+				}
+			}
+		} else {
+			throw new ServiceException("No existe este proveedor");
+		}
+
+	}
+
+	@Override
+	public Producto GetSingleProduct(UsuarioEmpresa usuarioEmpresa, Long businessId, Long productId)
+			throws ServiceException {
+		Empresa bddEmp = this.businessesRepository.findById(usuarioEmpresa.getEmpresa().getId());
+		Optional<Empresa> prov = this.businessesRepository.findByKey("rut", "" + businessId);
+		Empresa bddProv = prov.orElse(this.businessesRepository.findById(businessId));
+		if (bddEmp == null)
+			throw new ServiceException("No existe una Empresa asociada a este Usuario con el Id solicitado");
+		if (bddProv == null)
+			throw new ServiceException("No existe Empresa Proveedora con el Id enviado por parámetros");
+		Producto bddProd = this.productsRepository.findById(productId);
+		if (bddProd == null)
+			throw new ServiceException("No existe un Producto con el Id pasado parámetros");
+		if (bddProd.getEmpresa().getId() != bddProv.getId())
+			throw new ServiceException("El Producto con el Id pasado por parámetros no pertenece al Proveedor");
+
+		Optional<Producto> productoOptional = this.esVisiblePorEmpresa(bddEmp, bddProd);
+		if (productoOptional.isPresent()) {
+			return productoOptional.get();
+		}
+
+		throw new ServiceException("La Empresa no tiene visibilidad asignada sobre este producto");
+	}
+
+	/**
+	 * Método para determinar si un {@link Producto} es visible por una
+	 * {@link Empresa}
+	 * 
+	 * @param empresa
+	 * @param producto
+	 * @return Producto pasado por parámetros si la {@link Empresa} tiene
+	 *         visibilidad, de lo contrario devuelve null
+	 */
+	public Optional<Producto> esVisiblePorEmpresa(Empresa empresa, Producto producto) {
+		return this.productsRepository.obtenerProductoVisiblePorEmpresa(empresa.getId(), producto.getId());
+	}
+
+	@Override
+	public Set<Producto> GetAllVisible(UsuarioEmpresa usuarioEmpresa) throws ServiceException {
+		Empresa bddEmp = this.businessesRepository.findById(usuarioEmpresa.getEmpresa().getId());
+		if (bddEmp != null) {
+			Set<Producto> toReturn = new HashSet<Producto>();
+			List<Empresa> allProviders = this.businessesRepository.getAll();
+			for (Empresa business : allProviders) {
+				toReturn.addAll(this.obtenerProductosVisiblesPorEmpresa(bddEmp, business));
+			}
+			return toReturn;
+		} else
+			throw new ServiceException("No existe esta empresa");
+	}
+
+	/**
+	 * Devuelve el listado de los {@link Producto} que están visibles para la
+	 * Empresa Cliente del Proveedor pasado por parámetros
+	 * 
+	 * @param empresa   : Empresa Cliente
+	 * @param proveedor : Empresa Proveedor
+	 * @return Set de Productos Visibles
+	 */
+	private Set<Producto> obtenerProductosVisiblesPorEmpresa(Empresa empresa, Empresa proveedor) {
+
+		Set<Producto> productosVisibles = new HashSet<Producto>();
+		if (proveedor.getId() != empresa.getId()) {
+			Set<Producto> productos = this.productsRepository.getAll(proveedor);
+			for (Producto p : productos) {
+				boolean added = false;
+				if (p.isEsPublico()) {
+					productosVisibles.add(p);
+					continue;
+				}
+				if (p.getGruposConVisibilidad() != null) {
+					for (Grupo group : p.getGruposConVisibilidad()) {
+						Grupo bddGroup = this.groupsRepository.findById(group.getId());
+						Set<Empresa> groupBusinesses = bddGroup.getEmpresas();
+						if (groupBusinesses.contains(empresa)) {
+							added = true;
+							p.setVisibilidadPorGrupo(true);
+							productosVisibles.add(p);
+							break;
+						}
+					}
+					if (added)
+						continue;
+				}
+
+				if (p.getEmpresasConVisibilidad() != null) {
+					if (p.getEmpresasConVisibilidad().contains(empresa)) {
+						p.setVisibilidadPorGrupo(false);
+						productosVisibles.add(p);
+					}
+				}
+			}
+		}
+		return productosVisibles;
+	}
+
+	@Override
+	public Set<Producto> GetVisibleByBussinesOnSaleList(ListaDeVenta lv, UsuarioEmpresa usuarioEmpresa)
+			throws ServiceException {
+		return this.productsRepository.getVisibleByBussinesOnSaleList(usuarioEmpresa.getEmpresa(), lv);
+	}
+
+	@Override
+	public PaginadoResponse<List<Empresa>> obtenerEmpresasConVisibilidad(PaginadoRequest pr, Long idProducto,
+			UsuarioEmpresa usuarioEmpresa) throws ServiceException {
+		Producto producto = this.productsRepository.findById(idProducto);
+		if (producto == null)
+			throw new ServiceException("No existe un Producto con el Id pasado parámetros");
+		if (!producto.getEmpresa().getId().equals(usuarioEmpresa.getEmpresa().getId())) {
+			List<Empresa> l = new ArrayList<Empresa>();
+			l.add(usuarioEmpresa.getEmpresa());
+			return new PaginadoResponse<List<Empresa>>(pr.getPagina(), 1L, 1L, l);
+		}
+		try {
+			return this.productsRepository.obtenerEmpresasConVisibilidadEnProducto(pr, producto.getId(),
+					usuarioEmpresa.getEmpresa().getId());
+		} catch (ModelException e) {
+			throw new ServiceException("Error obteniendo Empresas con visibilidad." + e.getMessage());
+		}
+
+	}
+
+	@Override
+	public PaginadoResponse<List<Grupo>> obtenerGruposConVisibilidad(PaginadoRequest pr, Long idProducto,
+			UsuarioEmpresa usuarioEmpresa) throws ServiceException {
+		// TODO Iteracion 1: Implementar que devuelva todos cuando la Empresa es dueña
+		// del Producto
+		Producto producto = this.productsRepository.findById(idProducto);
+		if (producto == null)
+			throw new ServiceException("No existe un Producto con el Id pasado parámetros");
+		try {
+			return this.productsRepository.obtenerGruposConVisibilidadEnProducto(pr, producto.getId(),
+					usuarioEmpresa.getEmpresa().getId());
+		} catch (ModelException e) {
+			throw new ServiceException("Error obteniendo Empresas con visibilidad." + e.getMessage());
+		}
+	}
+
+	@Override
+	public String actualizarURLImagenes(String bucket, final Empresa empresa) {
+		Param amazonKey = paramsDAO.findByNombre("s3_key");
+		Param keyId = paramsDAO.findByNombre("s3_id");
+		AWSCredentials credentials = new BasicAWSCredentials(keyId.getValor(), amazonKey.getValor());
+		@SuppressWarnings("deprecation")
+		AmazonS3 s3Client = new AmazonS3Client(credentials);
+
+		ListObjectsRequest listObjectsRequest = new ListObjectsRequest().withBucketName(bucket)
+				.withPrefix("assets/images/Sebamar/").withDelimiter("/");
+		ObjectListing objects = s3Client.listObjects(listObjectsRequest);
+		objects.getObjectSummaries()
+
+				.stream()
+				.map(e -> new AbstractMap.SimpleEntry<String, String>(e.getKey(),
+						e.getKey().replace("assets/images/Sebamar/", "")))
+				.filter(e -> e.getValue().toLowerCase().contains(".jpg")).forEach(e -> {
+					String noExtension = e.getValue().replaceFirst(".jpg", "");
+					try {
+						long val = Long.parseLong(noExtension);
+
+						Optional<Producto> optionalProduct = this.productsRepository.findByGtin("" + val,
+								empresa.getId());
+						if (optionalProduct.isPresent()) {
+							Producto existingProduct = optionalProduct.get();
+							existingProduct.setFoto(e.getKey());
+							existingProduct.setGtin("" + val);
+							this.productsRepository.update(existingProduct);
+						}
+					} catch (Exception ex) {
+					}
+				});
+
+		return "ok";
+	}
+
+	@Override
+	public void crearClientesExcelRN(List<ExcelRNCliente> listaClientes, UsuarioEmpresa ue) throws ServiceException {
+		HashMap<String, List<String>> grupoEmpresas = new HashMap<String, List<String>>();
+		for (ExcelRNCliente excelRNCliente : listaClientes) {
+
+			for (String grupo : excelRNCliente.listadoGrupos()) {
+				if (!grupoEmpresas.containsKey(grupo)) {
+					grupoEmpresas.put(grupo, new ArrayList<String>());
+				}
+				List<String> listaEmpresas = grupoEmpresas.get(grupo);
+				listaEmpresas.add("" + excelRNCliente.getEanCode());
+				grupoEmpresas.put(grupo, listaEmpresas);
+			}
+		}
+
+	}
+
+	@Override
+	public List<ExcelProduct> crearProductosRN(List<ExcelRNProducto> listaProductos, UsuarioJwt usuario)
+			throws ServiceException {
+		// Inserto los que no son marcados para eliminar
+		List<ExcelProduct> productosAInsertar = listaProductos.stream()
+				.map(producto -> this.mapearProductoRNAProducto(producto, usuario.getUsuarioEmpresa().getEmpresa()))
+				.collect(Collectors.toList());
+
+		this.InsertExcel(productosAInsertar, usuario, true, true, true);
+
+		return productosAInsertar;
+	}
+
+	@Override
+	public List<ExcelProduct> crearProductosRN(List<ExcelRNProducto> listaProductos, UsuarioJwt usuario,
+			Empresa empresa) throws ServiceException {
+		// Inserto los que no son marcados para eliminar
+		List<ExcelProduct> productosAInsertar = listaProductos.stream()
+				.map(producto -> this.mapearProductoRNAProducto(producto, empresa)).collect(Collectors.toList());
+
+		this.InsertExcelRN(productosAInsertar, empresa, true, false, false);
+
+		return productosAInsertar;
+	}
+
+	@Override
+	public List<ExcelCliente> crearClientesRN(List<ExcelRNCliente> listaClientes, UsuarioJwt usuario, Empresa empresa)
+			throws ServiceException {
+		// Inserto los que no son marcados para eliminar
+		List<ExcelCliente> clientesAInsertar = listaClientes.stream()
+				.map(cliente -> this.mapearClienteRNAEmpresa(cliente, empresa)).collect(Collectors.toList());
+
+		this.InsertClienteExcel(clientesAInsertar, usuario, true, true, true);
+
+		return clientesAInsertar;
+	}
+
+	private ExcelProduct mapearProductoRNAProducto(ExcelRNProducto producto, Empresa empresa) {
+
+		ExcelProduct excelProducto = new ExcelProduct();
+		excelProducto.setProduct(Cloner.MAPPER.clone(producto));
+		excelProducto.setWasCreated(true);
+		excelProducto.getProduct().setEmpresa(empresa);
+		// Establezco la Empresa para evitar errores al insertar la Categoria. Tanto la
+		// Hija como la Padre
+		if (excelProducto.getProduct().getCategoria() != null)
+			excelProducto.getProduct().getCategoria().setEmpresa(empresa);
+		if (excelProducto.getProduct().getCategoria().getPadre() != null)
+			excelProducto.getProduct().getCategoria().getPadre().setEmpresa(empresa);
+		if (producto.getVisiblePor().getVisiblePorGrupos().trim().isEmpty()) {
+			excelProducto.getProduct().setEsPublico(true);
+		} else {
+			producto.listadoGrupos().stream()
+
+					.map(grupoNombre -> {
+						Grupo grupo = this.groupsRepository.obtenerGrupo(grupoNombre, empresa.getId());
+						if (grupo == null) {
+							grupo = new Grupo(grupoNombre, "");
+							grupo.setDescripcion("Grupo Sincronizado desde Rondanet");
+							grupo.setEmpresa(empresa);
+							this.groupsRepository.insert(grupo);
+						}
+						Producto prod = excelProducto.getProduct();
+						prod.getGruposConVisibilidad().add(grupo);
+						excelProducto.setProduct(prod);
+
+						return grupo;
+					}).peek(grupo -> excelProducto.getProduct().getGruposConVisibilidad().add(grupo))
+					.collect(Collectors.toList());
+		}
+
+		return excelProducto;
+	}
+
+	private ExcelCliente mapearClienteRNAEmpresa(ExcelRNCliente cliente, Empresa empresa) {
+
+		ExcelCliente excelCliente = new ExcelCliente();
+		excelCliente.setEmpresa(Cloner.MAPPER.clone(cliente));
+		excelCliente.setWasCreated(true);
+		if (!cliente.getVisiblePor().isEmpty()) {
+			cliente.listadoGrupos().stream()
+
+					.map(grupoNombre -> {
+						Grupo grupo = this.groupsRepository.obtenerGrupo(grupoNombre, empresa.getId());
+						if (grupo == null) {
+							grupo = new Grupo(grupoNombre, "");
+							grupo.setDescripcion("Grupo Sincronizado desde Rondanet");
+							grupo.setEmpresa(empresa);
+							this.groupsRepository.insert(grupo);
+						}
+						Empresa emp = excelCliente.getEmpresa();
+						emp.getGrupos().add(grupo);
+						excelCliente.setEmpresa(emp);
+
+						return grupo;
+					}).collect(Collectors.toList());
+		}
+
+		return excelCliente;
+	}
+
+}
